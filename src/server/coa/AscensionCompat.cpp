@@ -58,6 +58,7 @@
 #include "AscensionAuraAmounts.h"
 #include "AscensionMountSpeed.h"
 #include "AscensionClientSpellPatches.h"
+#include "AscensionClientSpellRows.h"
 #include "DBCfmt.h"
 #include "AscensionClassTuning.h"
 #include "AscensionBarbarian.h"
@@ -135,11 +136,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <type_traits>
 #include <deque>
@@ -4208,6 +4211,47 @@ public:
             SendItemRowOnDemand(player, itemId);
     }
 
+    void SetSpellRowOverride(AscensionSpellRowOverride hook)
+    {
+        _rowOverride.store(hook, std::memory_order_release);
+    }
+
+    // The row a client without per-player rows has: the prepared patch row when there is one,
+    // else the client file's row.
+    std::optional<AscensionSpellRow> OriginalSpellRow(uint32 spellId)
+    {
+        PreparedPatchRows const& rows = GetPreparedPatchRows();
+        std::optional<SpellPatchRow> row;
+        if (auto const found = rows.SpellRowIndexById.find(spellId); found != rows.SpellRowIndexById.end())
+        {
+            row = rows.Spells[found->second];
+            ApplyServerSpellSelectors(*row);
+        }
+        else
+        {
+            std::lock_guard lock(_clientSpellMutex);
+            if (auto const cached = _clientSpellRows.find(spellId); cached != _clientSpellRows.end())
+                row = cached->second;
+            else
+                row = _clientSpellRows.emplace(spellId, ReadClientSpellRow(spellId)).first->second;
+        }
+        if (!row)
+            return std::nullopt;
+        return AscensionSpellRow{row->Values, row->Strings};
+    }
+
+    bool SendPlayerSpellRow(Player* player, uint32 spellId, std::function<void(AscensionSpellRow&)> const& edit)
+    {
+        if (!player || !player->GetSession() || !ReceivesPatchRows(player))
+            return false;
+
+        std::optional<SpellPatchRow> const row = ClientSpellRow(player, spellId);
+        if (!row)
+            return false;
+        SendSpellRow(player, *row, edit);
+        return true;
+    }
+
     void SendSpellNoticeRow(Player* player, uint32 spellId, bool hidden)
     {
         if (!IsAscensionCustomClass(player) || !ReceivesPatchRows(player) || !player->IsInWorld())
@@ -4603,6 +4647,7 @@ private:
     std::array<std::string, SPELL_WIRE_STRING_FIELDS.size()> Strings;
     bool RequiresRegistration = false;
   };
+  static_assert(AscensionSpellRow::DWORDS == SPELL_CLIENT_RECORD_DWORDS);
 
   struct PreparedPatchRows {
     std::vector<uint32> CreatureDisplayIds;
@@ -5127,7 +5172,7 @@ private:
     return SendRowPacket(player, packet);
   }
 
-  std::size_t SendSpellRow(Player *player, SpellPatchRow const &row) const {
+  std::size_t SendSpellRowPacket(Player *player, SpellPatchRow const &row) const {
     WorldPacket packet(SMSG_PATCH_SPELL,
                        row.Values.size() * sizeof(uint32) + 1024);
     for (uint32 value : row.Values)
@@ -5135,6 +5180,26 @@ private:
     for (std::string const &text : row.Strings)
       AppendSizedString(packet, text);
     return SendRowPacket(player, packet);
+  }
+
+  // Every per-player Spell row goes through here: a module override (AscensionSetSpellRowOverride)
+  // and an optional edit change the row's values and text; the spell id is never changed.
+  std::size_t SendSpellRow(Player *player, SpellPatchRow const &row,
+                           std::function<void(AscensionSpellRow &)> const &edit = {}) const {
+    AscensionSpellRowOverride const hook = _rowOverride.load(std::memory_order_acquire);
+    if (!hook && !edit)
+      return SendSpellRowPacket(player, row);
+
+    AscensionSpellRow editable{row.Values, row.Strings};
+    if (hook)
+      hook(player, editable);
+    if (edit)
+      edit(editable);
+    SpellPatchRow sent = row;
+    sent.Values = editable.Values;
+    sent.Values[0] = row.Values[0];
+    sent.Strings = std::move(editable.Strings);
+    return SendSpellRowPacket(player, sent);
   }
 
   std::size_t SendSuperTrackRow(Player *player,
@@ -6187,6 +6252,8 @@ private:
   std::unordered_map<uint32, uint32> _swapEntrySpells;
   std::unordered_map<uint32, std::set<uint32>> _sentSwapEntries;
   std::vector<uint32> _freeEntryIds;
+
+  std::atomic<AscensionSpellRowOverride> _rowOverride{nullptr};
 };
 
 class AscensionCollectionService {
@@ -11813,6 +11880,21 @@ void ResendSkillLineAbilityRows(Player* player, uint32 spellId)
 {
     AscensionDisplayPatchService::Instance().ResendSkillLineAbilityRows(player, spellId);
 }
+}
+
+void AscensionSetSpellRowOverride(AscensionSpellRowOverride hook)
+{
+    AscensionDisplayPatchService::Instance().SetSpellRowOverride(hook);
+}
+
+std::optional<AscensionSpellRow> AscensionOriginalSpellRow(uint32 spellId)
+{
+    return AscensionDisplayPatchService::Instance().OriginalSpellRow(spellId);
+}
+
+bool AscensionSendPlayerSpellRow(Player* player, uint32 spellId, std::function<void(AscensionSpellRow&)> const& edit)
+{
+    return AscensionDisplayPatchService::Instance().SendPlayerSpellRow(player, spellId, edit);
 }
 
 AscensionVanityOwnership::TestOverride::TestOverride(bool unlockAll, std::string const& starterItems)
